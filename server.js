@@ -27,19 +27,18 @@ app.get('/api/users', (req, res) => {
     res.json({ count: activeUsers.size });
 });
 
-app.get('/api/chat', (req, res) => {
-    res.json({ messages: globalChatMessages });
-});
-
-app.post('/api/chat', (req, res) => {
-    const { username, text } = req.body;
+// Handle both /api/chat and /chat/send routes
+const handleChatPost = (req, res) => {
+    const username = req.body.username || req.body.Player || "Anonymous";
+    const text = req.body.text || req.body.Message || req.body.content;
+    
     if (!text || text.trim() === '') {
         return res.status(400).json({ error: "Message text cannot be empty" });
     }
 
     const newMessage = {
         id: Date.now().toString(),
-        username: username || "Anonymous",
+        username: username,
         text: text.trim(),
         timestamp: Date.now()
     };
@@ -49,8 +48,20 @@ app.post('/api/chat', (req, res) => {
         globalChatMessages.shift();
     }
 
-    res.json({ success: true, message: newMessage });
+    res.json({ success: true, message: newMessage, messages: globalChatMessages });
+};
+
+app.get('/api/chat', (req, res) => {
+    res.json({ messages: globalChatMessages });
 });
+
+app.get('/chat', (req, res) => {
+    res.json({ messages: globalChatMessages });
+});
+
+app.post('/api/chat', handleChatPost);
+app.post('/chat/send', handleChatPost);
+app.post('/api/chat/send', handleChatPost);
 
 app.get('/api/configs/:name', (req, res) => {
     const configName = req.params.name;
