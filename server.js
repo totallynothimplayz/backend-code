@@ -1,846 +1,928 @@
 
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 
-app.set('trust proxy', 1);
-
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use(express.json({ limit: "10mb" }));
 
-const DATA_FILE = process.env.DATA_FILE ||
-    path.join(__dirname, 'data', 'cloud-data.json');
+const PORT = process.env.PORT || 3000;
 
-const CHAT_LIMIT = 100;
-const PRESENCE_TIMEOUT = 60000;
+const DATA_DIR = path.join(__dirname, "data");
+const DATA_FILE = path.join(DATA_DIR, "cloud-data.json");
 
-let configs = [];
-let messages = [];
-let nextMessageId = 1;
+const HEARTBEAT_TIMEOUT = 60 * 1000;
+const MAX_HEARTBEAT_INTERVAL = 90 * 1000;
+
+let data = {
+    configs: [],
+    messages: [],
+    leaderboard: [],
+    nextConfigId: 1,
+    nextMessageId: 1
+};
 
 const presence = new Map();
 
-function loadData() {
-    try {
-        const data = JSON.parse(
-            fs.readFileSync(DATA_FILE, 'utf8')
-        );
+function now() {
+    return Date.now();
+}
 
-        configs = Array.isArray(data.configs)
-            ? data.configs
-            : [];
-
-        messages = Array.isArray(data.messages)
-            ? data.messages
-            : [];
-
-        nextMessageId = Number(data.nextMessageId) || 1;
-
-        if (messages.length > 0) {
-            nextMessageId = Math.max(
-                nextMessageId,
-                ...messages.map(m => Number(m.Id) || 0)
-            ) + 1;
-        }
-
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            console.error('Load error:', error.message);
-        }
-
-        configs = [];
-        messages = [];
-        nextMessageId = 1;
-    }
+function makeId() {
+    return `${now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function saveData() {
     try {
-        fs.mkdirSync(path.dirname(DATA_FILE), {
-            recursive: true
-        });
+        fs.mkdirSync(DATA_DIR, { recursive: true });
 
-        const temp = DATA_FILE + '.tmp';
+        const temporaryFile = DATA_FILE + ".tmp";
 
-        fs.writeFileSync(temp, JSON.stringify({
-            configs,
-            messages,
-            nextMessageId
-        }, null, 2));
+        fs.writeFileSync(
+            temporaryFile,
+            JSON.stringify(data, null, 2),
+            "utf8"
+        );
 
-        fs.renameSync(temp, DATA_FILE);
+        fs.renameSync(temporaryFile, DATA_FILE);
 
+        return true;
     } catch (error) {
-        console.error('Save error:', error.message);
+        console.error("Failed to save data:", error);
+        return false;
     }
 }
 
-function str(value, fallback = '') {
-    return typeof value === 'string'
-        ? value.trim()
-        : fallback;
+function loadData() {
+    try {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+
+        if (!fs.existsSync(DATA_FILE)) {
+            saveData();
+            return;
+        }
+
+        const loaded = JSON.parse(
+            fs.readFileSync(DATA_FILE, "utf8")
+        );
+
+        data.configs = Array.isArray(loaded.configs)
+            ? loaded.configs
+            : [];
+
+        data.messages = Array.isArray(loaded.messages)
+            ? loaded.messages
+            : [];
+
+        data.leaderboard = Array.isArray(loaded.leaderboard)
+            ? loaded.leaderboard
+            : [];
+
+        data.nextConfigId =
+            Number(loaded.nextConfigId) || 1;
+
+        data.nextMessageId =
+            Number(loaded.nextMessageId) || 1;
+
+        for (const player of data.leaderboard) {
+            player.Identity = String(
+                player.Identity || player.identity || ""
+            );
+
+            player.UserId =
+                player.UserId ?? player.userId ?? null;
+
+            player.NamePreview = String(
+                player.NamePreview ||
+                player.Username ||
+                player.username ||
+                "Unknown"
+            );
+
+            player.TotalSeconds = Math.max(
+                0,
+                Number(
+                    player.TotalSeconds ??
+                    player.totalSeconds ??
+                    player.Time ??
+                    0
+                ) || 0
+            );
+
+            player.LastSeen = Number(
+                player.LastSeen || 0
+            );
+
+            player.CreatedAt = Number(
+                player.CreatedAt || now()
+            );
+        }
+
+        console.log("Data loaded successfully.");
+    } catch (error) {
+        console.error("Failed to load data:", error);
+        throw error;
+    }
 }
 
 function getIdentity(req) {
-    return str(
-        req.headers['x-nullui-identity'] ||
-        req.headers['x-user-id'] ||
-        req.body?.UserId ||
-        req.body?.userId,
-        'anonymous'
-    ).slice(0, 128);
-}
+    const body = req.body || {};
 
-function getScript(req) {
-    return str(
-        req.headers['x-nullui-script'] ||
-        req.body?.Script ||
-        req.body?.script,
-        'default'
-    ).slice(0, 128);
-}
+    const identity =
+        body.Identity ||
+        body.identity ||
+        body.UserId ||
+        body.userId ||
+        body.Username ||
+        body.username;
 
-function getPayload(body) {
-    if (!body || typeof body !== 'object') {
+    if (identity === undefined || identity === null) {
         return null;
     }
 
-    return body.Data ??
-        body.data ??
-        body.Config ??
-        body.config ??
-        body;
+    const result = String(identity).trim();
+
+    if (!result || result.length > 200) {
+        return null;
+    }
+
+    return result;
 }
 
-function publicConfig(item) {
-    return {
-        Id: item.id,
-        id: item.id,
+function getPlayerName(req) {
+    const body = req.body || {};
 
-        Name: item.name,
-        name: item.name,
-        Title: item.name,
-        title: item.name,
-
-        Description: item.description,
-        description: item.description,
-
-        Tags: item.tags || [],
-        tags: item.tags || [],
-
-        Script: item.script,
-        script: item.script,
-
-        Author: item.author,
-        author: item.author,
-
-        CreatedAt: item.createdAt,
-        createdAt: item.createdAt,
-
-        UpdatedAt: item.updatedAt,
-        updatedAt: item.updatedAt,
-
-        Likes: item.likes,
-        likes: item.likes,
-
-        Downloads: item.downloads,
-        downloads: item.downloads,
-
-        ShareCode: item.shareCode,
-        shareCode: item.shareCode,
-
-        Data: item.data,
-        data: item.data
-    };
+    return String(
+        body.NamePreview ||
+        body.Username ||
+        body.username ||
+        body.Name ||
+        body.name ||
+        "Unknown"
+    ).slice(0, 100);
 }
 
-function findConfig(id) {
-    return configs.find(item =>
-        item.id === id ||
-        item.shareCode === id
+function getUserId(req) {
+    const body = req.body || {};
+
+    return body.UserId ??
+        body.userId ??
+        null;
+}
+
+function findLeaderboardPlayer(identity) {
+    return data.leaderboard.find(
+        player => player.Identity === identity
     );
 }
 
-loadData();
-
-// HEALTH
-
-app.get('/', (req, res) => {
-    res.json({
-        status: 'ok',
-        message: 'Vind UI Backend Running'
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok'
-    });
-});
-
-// CONFIG LIST
-
-app.get('/configs', (req, res) => {
-    const query = str(req.query.q).toLowerCase();
-    const sort = str(req.query.sort, 'top');
-
-    const limit = Math.min(
-        Math.max(parseInt(req.query.limit, 10) || 20, 1),
-        100
-    );
-
-    let list = configs.filter(item => {
-        if (!query) return true;
-
-        const searchable = [
-            item.name,
-            item.description,
-            item.author,
-            item.script,
-            ...(item.tags || [])
-        ].join(' ').toLowerCase();
-
-        return searchable.includes(query);
-    });
-
-    if (sort === 'top' || sort === 'popular') {
-        list.sort((a, b) =>
-            b.likes - a.likes ||
-            b.createdAt - a.createdAt
-        );
-    } else if (sort === 'downloads') {
-        list.sort((a, b) =>
-            b.downloads - a.downloads
-        );
-    } else {
-        list.sort((a, b) =>
-            b.createdAt - a.createdAt
-        );
-    }
-
-    const cursor = Math.max(
-        parseInt(req.query.cursor, 10) || 0,
-        0
-    );
-
-    const page = list.slice(cursor, cursor + limit);
-
-    const nextCursor = cursor + limit < list.length
-        ? String(cursor + limit)
-        : null;
-
-    res.json({
-        Success: true,
-        success: true,
-
-        Items: page.map(publicConfig),
-        items: page.map(publicConfig),
-
-        NextCursor: nextCursor,
-        nextCursor
-    });
-});
-
-// MY CONFIGS
-
-app.get('/configs/mine', (req, res) => {
-    const owner = getIdentity(req);
-
-    const items = configs
-        .filter(item => item.owner === owner)
-        .map(publicConfig);
-
-    res.json({
-        Success: true,
-        success: true,
-        Items: items,
-        items
-    });
-});
-
-// GET CONFIG BY SHARE CODE
-
-app.get('/configs/code/:shareCode', (req, res) => {
-    const item = findConfig(req.params.shareCode);
-
-    if (!item) {
-        return res.status(404).json({
-            success: false,
-            error: 'Config not found'
-        });
-    }
-
-    res.json({
-        Success: true,
-        success: true,
-
-        Id: item.id,
-        Name: item.name,
-        Description: item.description,
-        Tags: item.tags || [],
-        Author: item.author,
-
-        Data: item.data,
-        data: item.data,
-
-        Config: publicConfig(item),
-        config: publicConfig(item),
-        Item: publicConfig(item),
-        item: publicConfig(item)
-    });
-});
-
-// GET CONFIG BY ID
-
-app.get('/configs/:id', (req, res) => {
-    const item = findConfig(req.params.id);
-
-    if (!item) {
-        return res.status(404).json({
-            success: false,
-            error: 'Config not found'
-        });
-    }
-
-    res.json({
-        Success: true,
-        success: true,
-
-        Id: item.id,
-        Name: item.name,
-        Description: item.description,
-        Tags: item.tags || [],
-        Author: item.author,
-
-        Data: item.data,
-        data: item.data,
-
-        Config: publicConfig(item),
-        config: publicConfig(item),
-        Item: publicConfig(item),
-        item: publicConfig(item)
-    });
-});
-
-// PUBLISH CONFIG
-
-app.post('/configs', (req, res) => {
-    const data = getPayload(req.body);
-
-    if (data === null || data === undefined) {
-        return res.status(400).json({
-            success: false,
-            error: 'Invalid config data'
-        });
-    }
-
-    const owner = getIdentity(req);
-
-    const name = str(
-        req.body.Name ||
-        req.body.name ||
-        req.body.Title ||
-        req.body.title,
-        'Untitled'
-    ).slice(0, 60);
-
-    const description = str(
-        req.body.Description ||
-        req.body.description
-    ).slice(0, 280);
-
-    const tags = Array.isArray(req.body.Tags)
-        ? req.body.Tags
-            .filter(tag => typeof tag === 'string')
-            .slice(0, 8)
-        : [];
-
-    const item = {
-        id: crypto.randomUUID(),
-
-        shareCode: crypto
-            .randomBytes(6)
-            .toString('hex')
-            .toUpperCase(),
-
-        name,
-        description,
-        tags,
-
-        script: getScript(req),
-
-        author: owner,
-        owner,
-
-        ownerToken: crypto
-            .randomBytes(24)
-            .toString('hex'),
-
-        data,
-
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-
-        likes: 0,
-        downloads: 0,
-        likedBy: []
-    };
-
-    configs.unshift(item);
-
-    saveData();
-
-    // Exact fields required by the UI's Publish method:
-    // decoded.Id and decoded.OwnerToken
-
-    res.status(201).json({
-        Success: true,
-        success: true,
-
-        Id: item.id,
-        OwnerToken: item.ownerToken,
-
-        id: item.id,
-        ownerToken: item.ownerToken,
-
-        ShareCode: item.shareCode,
-        shareCode: item.shareCode,
-
-        Item: publicConfig(item),
-        item: publicConfig(item),
-        Config: publicConfig(item),
-        config: publicConfig(item)
-    });
-});
-
-// DELETE CONFIG
-
-app.delete('/configs/:id', (req, res) => {
-    const index = configs.findIndex(
-        item => item.id === req.params.id
-    );
-
-    if (index === -1) {
-        return res.status(404).json({
-            success: false,
-            error: 'Config not found'
-        });
-    }
-
-    const item = configs[index];
-
-    const token = str(
-        req.headers['x-nullui-owner-token'] ||
-        req.headers['x-nullui-token'] ||
-        req.body?.OwnerToken ||
-        req.body?.token
-    );
-
-    if (
-        item.owner !== getIdentity(req) &&
-        (!token || token !== item.ownerToken)
-    ) {
-        return res.status(403).json({
-            success: false,
-            error: 'Not authorized'
-        });
-    }
-
-    configs.splice(index, 1);
-
-    saveData();
-
-    res.json({
-        Success: true,
-        success: true
-    });
-});
-
-// LIKE CONFIG
-
-app.post('/configs/:id/like', (req, res) => {
-    const item = findConfig(req.params.id);
-
-    if (!item) {
-        return res.status(404).json({
-            success: false,
-            error: 'Config not found'
-        });
-    }
-
-    const user = getIdentity(req);
-
-    if (!item.likedBy.includes(user)) {
-        item.likedBy.push(user);
-        item.likes++;
-        saveData();
-    }
-
-    res.json({
-        Success: true,
-        success: true,
-        Likes: item.likes,
-        likes: item.likes
-    });
-});
-
-// DOWNLOAD CONFIG
-
-app.post('/configs/:id/download', (req, res) => {
-    const item = findConfig(req.params.id);
-
-    if (!item) {
-        return res.status(404).json({
-            success: false,
-            error: 'Config not found'
-        });
-    }
-
-    item.downloads++;
-
-    saveData();
-
-    res.json({
-        Success: true,
-        success: true,
-
-        Id: item.id,
-        Data: item.data,
-        data: item.data,
-
-        Item: publicConfig(item),
-        item: publicConfig(item)
-    });
-});
-
-// LEGACY NAMED CONFIG ROUTES
-
-app.get('/api/configs/name/:name', (req, res) => {
-    const item = configs.find(config =>
-        config.name === req.params.name &&
-        config.owner === getIdentity(req)
-    );
-
-    if (!item) {
-        return res.status(404).json({
-            success: false,
-            error: 'Config not found'
-        });
-    }
-
-    res.json({
-        success: true,
-        data: item.data
-    });
-});
-
-app.post('/api/configs/name/:name', (req, res) => {
-    const data = getPayload(req.body);
-
-    if (data === null || data === undefined) {
-        return res.status(400).json({
-            success: false,
-            error: 'Invalid config'
-        });
-    }
-
-    const owner = getIdentity(req);
-    const name = req.params.name.slice(0, 100);
-
-    let item = configs.find(config =>
-        config.name === name &&
-        config.owner === owner
-    );
-
-    if (item) {
-        item.data = data;
-        item.updatedAt = Date.now();
-    } else {
-        item = {
-            id: crypto.randomUUID(),
-
-            shareCode: crypto
-                .randomBytes(6)
-                .toString('hex')
-                .toUpperCase(),
-
-            name,
-            description: '',
-            tags: [],
-            script: getScript(req),
-
-            author: owner,
-            owner,
-
-            ownerToken: crypto
-                .randomBytes(24)
-                .toString('hex'),
-
-            data,
-
-            createdAt: Date.now(),
-            updatedAt: Date.now(),
-
-            likes: 0,
-            downloads: 0,
-            likedBy: []
+function getOrCreateLeaderboardPlayer(req, identity) {
+    let player = findLeaderboardPlayer(identity);
+
+    if (!player) {
+        player = {
+            Identity: identity,
+            UserId: getUserId(req),
+            NamePreview: getPlayerName(req),
+            TotalSeconds: 0,
+            CreatedAt: now(),
+            LastSeen: 0
         };
 
-        configs.unshift(item);
+        data.leaderboard.push(player);
     }
 
-    saveData();
+    if (getUserId(req) !== null) {
+        player.UserId = getUserId(req);
+    }
 
-    res.json({
-        success: true,
-        data: publicConfig(item)
-    });
-});
+    const name = getPlayerName(req);
 
-// PRESENCE
+    if (name !== "Unknown") {
+        player.NamePreview = name;
+    }
 
-function prunePresence() {
-    const now = Date.now();
+    return player;
+}
 
-    for (const [id, user] of presence.entries()) {
-        if (now - user.lastSeen > PRESENCE_TIMEOUT) {
-            presence.delete(id);
+function formatPlayer(player, isOnline) {
+    const totalSeconds = Math.max(
+        0,
+        Math.floor(Number(player.TotalSeconds) || 0)
+    );
+
+    return {
+        Identity: player.Identity,
+        UserId: player.UserId,
+        NamePreview: player.NamePreview,
+        TotalSeconds: totalSeconds,
+        OnlineTime: totalSeconds,
+        Time: totalSeconds,
+        IsOnline: Boolean(isOnline),
+        LastSeen: player.LastSeen || 0,
+        CreatedAt: player.CreatedAt || 0
+    };
+}
+
+function cleanExpiredPresence() {
+    const currentTime = now();
+
+    for (const [identity, session] of presence.entries()) {
+        if (
+            currentTime - session.lastSeen >
+            HEARTBEAT_TIMEOUT
+        ) {
+            presence.delete(identity);
         }
     }
 }
 
-app.post('/presence/heartbeat', (req, res) => {
-    const id = getIdentity(req);
-
-    const userId = Number(req.body?.UserId) || 0;
-
-    const namePreview = str(
-        req.body?.NamePreview,
-        'Anonymous'
-    ).slice(0, 64);
-
-    presence.set(id, {
-        Identity: id,
-        UserId: userId,
-        NamePreview: namePreview,
-        lastSeen: Date.now()
-    });
-
-    prunePresence();
-
-    res.json({
-        Success: true,
-        success: true,
-        Count: presence.size,
-        count: presence.size
-    });
-});
-
-app.get('/presence/count', (req, res) => {
-    prunePresence();
-
-    res.json({
-        Success: true,
-        success: true,
-        Count: presence.size,
-        count: presence.size
-    });
-});
-
-// LEADERBOARD
-// UI expects objects with Identity and NamePreview.
-// Do not return plain strings.
-
-app.get('/presence/leaderboard', (req, res) => {
-    prunePresence();
-
-    const limit = Math.min(
-        Math.max(parseInt(req.query.limit, 10) || 10, 1),
-        100
-    );
-
-    const items = [...presence.values()]
-        .sort((a, b) => b.lastSeen - a.lastSeen)
-        .slice(0, limit)
-        .map(user => ({
-            Identity: user.Identity,
-            UserId: user.UserId,
-            NamePreview: user.NamePreview
-        }));
-
-    res.json({
-        Success: true,
-        success: true,
-
-        Items: items,
-        items,
-
-        Count: items.length,
-        count: items.length
-    });
-});
-
-// CHAT MESSAGE FORMAT
-// UI requires Id, UserId, Text, CreatedAt.
-// Id is numeric because the UI compares it with lastSeenId.
-
-function createMessage(req) {
-    const body = req.body || {};
-
-    const text = str(
-        body.Text ||
-        body.text ||
-        body.Message ||
-        body.message
-    ).slice(0, 1000);
-
-    if (!text) return null;
-
-    const id = getIdentity(req);
-
-    const message = {
-        Id: nextMessageId++,
-
-        UserId: Number(body.UserId) || 0,
-
-        Identity: id,
-
-        Username: id,
-
-        Text: text,
-
-        CreatedAt: Date.now()
+function getPublicConfig(config) {
+    return {
+        Id: config.Id,
+        id: config.Id,
+        Name: config.Name,
+        name: config.Name,
+        Username: config.Username,
+        username: config.Username,
+        Identity: config.Identity,
+        identity: config.Identity,
+        Description: config.Description || "",
+        description: config.Description || "",
+        Code: config.Code || "",
+        code: config.Code || "",
+        ShareCode: config.ShareCode,
+        shareCode: config.ShareCode,
+        CreatedAt: config.CreatedAt,
+        createdAt: config.CreatedAt,
+        Likes: config.Likes || 0,
+        likes: config.Likes || 0,
+        Downloads: config.Downloads || 0,
+        downloads: config.Downloads || 0,
+        Published: Boolean(config.Published),
+        published: Boolean(config.Published)
     };
-
-    return message;
 }
 
-// SEND CHAT
-
-app.post('/chat/send', (req, res) => {
-    const message = createMessage(req);
-
-    if (!message) {
-        return res.status(400).json({
-            success: false,
-            error: 'Message text required'
-        });
-    }
-
-    messages.push(message);
-
-    if (messages.length > CHAT_LIMIT) {
-        messages = messages.slice(-CHAT_LIMIT);
-    }
-
-    saveData();
-
-    // UI expects result.Id directly.
-    // Return the message itself, not { message: message }.
-
-    res.json({
-        Success: true,
-        success: true,
-
+function getPublicMessage(message) {
+    return {
         Id: message.Id,
         UserId: message.UserId,
         Identity: message.Identity,
         Username: message.Username,
         Text: message.Text,
         CreatedAt: message.CreatedAt
+    };
+}
+
+function getConfigById(id) {
+    return data.configs.find(
+        config => String(config.Id) === String(id)
+    );
+}
+
+function getConfigByShareCode(code) {
+    return data.configs.find(
+        config => config.ShareCode === String(code)
+    );
+}
+
+function getRequestValue(req, ...keys) {
+    for (const key of keys) {
+        if (req.body && req.body[key] !== undefined) {
+            return req.body[key];
+        }
+
+        if (req.query && req.query[key] !== undefined) {
+            return req.query[key];
+        }
+    }
+
+    return undefined;
+}
+
+app.get("/", (req, res) => {
+    res.json({
+        success: true,
+        message: "Cloud backend online",
+        version: "2.0"
     });
 });
 
-// POLL CHAT
+app.get("/health", (req, res) => {
+    res.json({
+        success: true,
+        status: "online"
+    });
+});
 
-app.get('/chat', (req, res) => {
-    const since = Number(req.query.since) || 0;
-
-    const result = messages.filter(
-        message => message.Id > since
+app.get("/configs", (req, res) => {
+    let configs = data.configs.filter(
+        config => config.Published
     );
+
+    const search = String(
+        req.query.search || ""
+    ).toLowerCase();
+
+    if (search) {
+        configs = configs.filter(config =>
+            String(config.Name || "")
+                .toLowerCase()
+                .includes(search) ||
+            String(config.Username || "")
+                .toLowerCase()
+                .includes(search)
+        );
+    }
+
+    const sort = String(
+        req.query.sort || "newest"
+    ).toLowerCase();
+
+    if (sort === "likes") {
+        configs.sort(
+            (a, b) => (b.Likes || 0) - (a.Likes || 0)
+        );
+    } else if (sort === "downloads") {
+        configs.sort(
+            (a, b) =>
+                (b.Downloads || 0) -
+                (a.Downloads || 0)
+        );
+    } else {
+        configs.sort(
+            (a, b) =>
+                (b.CreatedAt || 0) -
+                (a.CreatedAt || 0)
+        );
+    }
+
+    const result = configs.map(getPublicConfig);
 
     res.json({
-        Success: true,
         success: true,
-
-        Messages: result,
-        messages: result
+        Configs: result,
+        configs: result
     });
 });
 
-// REPORT CHAT MESSAGE
-
-app.post('/chat/:id/report', (req, res) => {
-    const id = Number(req.params.id);
-
-    const message = messages.find(
-        item => item.Id === id
+app.get("/configs/mine", (req, res) => {
+    const identity = String(
+        req.query.Identity ||
+        req.query.identity ||
+        req.query.UserId ||
+        req.query.userId ||
+        ""
     );
 
-    if (!message) {
+    const configs = data.configs.filter(
+        config => config.Identity === identity
+    );
+
+    const result = configs.map(getPublicConfig);
+
+    res.json({
+        success: true,
+        Configs: result,
+        configs: result
+    });
+});
+
+app.get("/configs/code/:shareCode", (req, res) => {
+    const config = getConfigByShareCode(
+        req.params.shareCode
+    );
+
+    if (!config) {
         return res.status(404).json({
             success: false,
-            error: 'Message not found'
+            error: "Config not found"
         });
     }
 
-    console.log('Chat report:', {
-        messageId: id,
-        reporter: getIdentity(req),
-        text: message.Text
-    });
+    const result = getPublicConfig(config);
 
     res.json({
-        Success: true,
         success: true,
-        message: 'Report received'
+        Config: result,
+        config: result
     });
 });
 
-// ERROR HANDLING
+app.get("/configs/:id", (req, res) => {
+    const config = getConfigById(req.params.id);
+
+    if (!config) {
+        return res.status(404).json({
+            success: false,
+            error: "Config not found"
+        });
+    }
+
+    const result = getPublicConfig(config);
+
+    res.json({
+        success: true,
+        Config: result,
+        config: result
+    });
+});
+
+app.post("/configs", (req, res) => {
+    const identity = getIdentity(req);
+
+    if (!identity) {
+        return res.status(400).json({
+            success: false,
+            error: "Identity is required"
+        });
+    }
+
+    const name = String(
+        getRequestValue(req, "Name", "name") ||
+        "Untitled"
+    ).slice(0, 100);
+
+    const code = String(
+        getRequestValue(req, "Code", "code") ||
+        ""
+    );
+
+    const description = String(
+        getRequestValue(req, "Description", "description") ||
+        ""
+    ).slice(0, 1000);
+
+    const config = {
+        Id: data.nextConfigId++,
+        Name: name,
+        Username: getPlayerName(req),
+        Identity: identity,
+        UserId: getUserId(req),
+        Description: description,
+        Code: code,
+        ShareCode: makeId(),
+        CreatedAt: now(),
+        Likes: 0,
+        Downloads: 0,
+        Published: Boolean(
+            getRequestValue(req, "Published", "published")
+        )
+    };
+
+    data.configs.push(config);
+
+    saveData();
+
+    const result = getPublicConfig(config);
+
+    res.json({
+        success: true,
+        Config: result,
+        config: result,
+        Id: config.Id,
+        id: config.Id
+    });
+});
+
+app.delete("/configs/:id", (req, res) => {
+    const identity = getIdentity(req);
+
+    const index = data.configs.findIndex(
+        config =>
+            String(config.Id) === String(req.params.id)
+    );
+
+    if (index === -1) {
+        return res.status(404).json({
+            success: false,
+            error: "Config not found"
+        });
+    }
+
+    const config = data.configs[index];
+
+    if (
+        identity &&
+        config.Identity !== identity
+    ) {
+        return res.status(403).json({
+            success: false,
+            error: "Not your config"
+        });
+    }
+
+    data.configs.splice(index, 1);
+
+    saveData();
+
+    res.json({
+        success: true
+    });
+});
+
+app.post("/configs/:id/publish", (req, res) => {
+    const config = getConfigById(req.params.id);
+
+    if (!config) {
+        return res.status(404).json({
+            success: false,
+            error: "Config not found"
+        });
+    }
+
+    const identity = getIdentity(req);
+
+    if (
+        identity &&
+        identity !== config.Identity
+    ) {
+        return res.status(403).json({
+            success: false,
+            error: "Not your config"
+        });
+    }
+
+    config.Published = true;
+
+    saveData();
+
+    res.json({
+        success: true,
+        Config: getPublicConfig(config)
+    });
+});
+
+app.post("/configs/:id/like", (req, res) => {
+    const config = getConfigById(req.params.id);
+
+    if (!config) {
+        return res.status(404).json({
+            success: false,
+            error: "Config not found"
+        });
+    }
+
+    config.Likes = (config.Likes || 0) + 1;
+
+    saveData();
+
+    res.json({
+        success: true,
+        Likes: config.Likes,
+        likes: config.Likes
+    });
+});
+
+app.post("/configs/:id/download", (req, res) => {
+    const config = getConfigById(req.params.id);
+
+    if (!config) {
+        return res.status(404).json({
+            success: false,
+            error: "Config not found"
+        });
+    }
+
+    config.Downloads = (config.Downloads || 0) + 1;
+
+    saveData();
+
+    res.json({
+        success: true,
+        Config: getPublicConfig(config),
+        config: getPublicConfig(config),
+        Code: config.Code,
+        code: config.Code
+    });
+});
+
+app.get("/api/configs/:name", (req, res) => {
+    const identity = String(
+        req.query.Identity ||
+        req.query.identity ||
+        ""
+    );
+
+    const config = data.configs.find(
+        item =>
+            item.Name === req.params.name &&
+            (!identity || item.Identity === identity)
+    );
+
+    if (!config) {
+        return res.status(404).json({
+            success: false,
+            error: "Config not found"
+        });
+    }
+
+    res.json({
+        success: true,
+        config: getPublicConfig(config)
+    });
+});
+
+app.post("/api/configs/:name", (req, res) => {
+    const identity = getIdentity(req);
+
+    if (!identity) {
+        return res.status(400).json({
+            success: false,
+            error: "Identity is required"
+        });
+    }
+
+    const name = String(req.params.name).slice(0, 100);
+
+    let config = data.configs.find(
+        item =>
+            item.Name === name &&
+            item.Identity === identity
+    );
+
+    if (config) {
+        config.Code = String(
+            getRequestValue(req, "Code", "code") || ""
+        );
+
+        config.Description = String(
+            getRequestValue(req, "Description", "description") ||
+            ""
+        );
+
+        config.CreatedAt = now();
+    } else {
+        config = {
+            Id: data.nextConfigId++,
+            Name: name,
+            Username: getPlayerName(req),
+            Identity: identity,
+            UserId: getUserId(req),
+            Description: String(
+                getRequestValue(req, "Description", "description") ||
+                ""
+            ),
+            Code: String(
+                getRequestValue(req, "Code", "code") || ""
+            ),
+            ShareCode: makeId(),
+            CreatedAt: now(),
+            Likes: 0,
+            Downloads: 0,
+            Published: false
+        };
+
+        data.configs.push(config);
+    }
+
+    saveData();
+
+    res.json({
+        success: true,
+        config: getPublicConfig(config)
+    });
+});
+
+app.get("/chat", (req, res) => {
+    const limit = Math.max(
+        1,
+        Math.min(
+            Number(req.query.limit) || 100,
+            500
+        )
+    );
+
+    const messages = data.messages
+        .slice(-limit)
+        .map(getPublicMessage);
+
+    res.json({
+        success: true,
+        Messages: messages,
+        messages: messages
+    });
+});
+
+app.get("/chat/history", (req, res) => {
+    const limit = Math.max(
+        1,
+        Math.min(
+            Number(req.query.limit) || 100,
+            500
+        )
+    );
+
+    const messages = data.messages
+        .slice(-limit)
+        .map(getPublicMessage);
+
+    res.json({
+        success: true,
+        Messages: messages,
+        messages: messages
+    });
+});
+
+app.post("/chat/send", (req, res) => {
+    const identity = getIdentity(req);
+
+    if (!identity) {
+        return res.status(400).json({
+            success: false,
+            error: "Identity is required"
+        });
+    }
+
+    const text = String(
+        getRequestValue(
+            req,
+            "Text",
+            "text",
+            "Message",
+            "message"
+        ) || ""
+    ).trim();
+
+    if (!text) {
+        return res.status(400).json({
+            success: false,
+            error: "Message is empty"
+        });
+    }
+
+    if (text.length > 2000) {
+        return res.status(400).json({
+            success: false,
+            error: "Message is too long"
+        });
+    }
+
+    const message = {
+        Id: data.nextMessageId++,
+        UserId: getUserId(req),
+        Identity: identity,
+        Username: getPlayerName(req),
+        Text: text,
+        CreatedAt: now()
+    };
+
+    data.messages.push(message);
+
+    if (data.messages.length > 1000) {
+        data.messages = data.messages.slice(-1000);
+    }
+
+    saveData();
+
+    const publicMessage = getPublicMessage(message);
+
+    res.json({
+        success: true,
+        ...publicMessage,
+        Message: publicMessage,
+        message: publicMessage
+    });
+});
+
+app.post("/presence/heartbeat", (req, res) => {
+    const identity = getIdentity(req);
+
+    if (!identity) {
+        return res.status(400).json({
+            success: false,
+            error: "Identity is required"
+        });
+    }
+
+    const currentTime = now();
+
+    const player = getOrCreateLeaderboardPlayer(
+        req,
+        identity
+    );
+
+    const previous = presence.get(identity);
+
+    let addedSeconds = 0;
+
+    if (previous) {
+        const elapsed = currentTime - previous.lastSeen;
+
+        if (
+            elapsed > 0 &&
+            elapsed <= MAX_HEARTBEAT_INTERVAL
+        ) {
+            addedSeconds = elapsed / 1000;
+        }
+    }
+
+    player.TotalSeconds =
+        Math.max(0, Number(player.TotalSeconds) || 0) +
+        addedSeconds;
+
+    player.LastSeen = currentTime;
+
+    presence.set(identity, {
+        Identity: identity,
+        UserId: player.UserId,
+        NamePreview: player.NamePreview,
+        lastSeen: currentTime
+    });
+
+    saveData();
+
+    const publicPlayer = formatPlayer(
+        player,
+        true
+    );
+
+    res.json({
+        success: true,
+        Player: publicPlayer,
+        player: publicPlayer,
+        Identity: identity,
+        TotalSeconds: publicPlayer.TotalSeconds,
+        OnlineTime: publicPlayer.OnlineTime,
+        Time: publicPlayer.Time
+    });
+});
+
+app.get("/presence/count", (req, res) => {
+    cleanExpiredPresence();
+
+    res.json({
+        success: true,
+        Count: presence.size,
+        count: presence.size
+    });
+});
+
+app.get("/presence/leaderboard", (req, res) => {
+    cleanExpiredPresence();
+
+    const onlineIdentities = new Set(
+        presence.keys()
+    );
+
+    const players = data.leaderboard
+        .map(player => {
+            const online = onlineIdentities.has(
+                player.Identity
+            );
+
+            return formatPlayer(
+                player,
+                online
+            );
+        })
+        .sort(
+            (a, b) =>
+                b.TotalSeconds - a.TotalSeconds
+        );
+
+    const limit = Math.max(
+        1,
+        Math.min(
+            Number(req.query.limit) || 100,
+            500
+        )
+    );
+
+    const result = players.slice(0, limit);
+
+    res.json({
+        success: true,
+        Players: result,
+        players: result,
+        Leaderboard: result,
+        leaderboard: result
+    });
+});
 
 app.use((req, res) => {
     res.status(404).json({
         success: false,
-        error: 'Endpoint not found',
+        error: "Route not found",
         path: req.path
     });
 });
 
 app.use((error, req, res, next) => {
-    console.error('Request error:', error.message);
+    console.error("Server error:", error);
 
-    res.status(error.status || 500).json({
+    res.status(500).json({
         success: false,
-        error: error.status === 413
-            ? 'Request too large'
-            : 'Internal server error'
+        error: "Internal server error"
     });
 });
 
-// RENDER
+loadData();
 
-const PORT = Number(process.env.PORT) || 10000;
-
-const server = app.listen(
-    PORT,
-    '0.0.0.0',
-    () => {
-        console.log(
-            `Vind UI backend listening on port ${PORT}`
-        );
-    }
-);
-
-function shutdown() {
-    server.close(() => process.exit(0));
-}
-
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Cloud backend running on port ${PORT}`);
+});
