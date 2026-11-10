@@ -27,8 +27,7 @@ app.get('/api/users', (req, res) => {
     res.json({ count: activeUsers.size });
 });
 
-// Handle both /api/chat and /chat/send routes
-const handleChatPost = (req, res) => {
+const handleChat = (req, res) => {
     const username = req.body.username || req.body.Player || "Anonymous";
     const text = req.body.text || req.body.Message || req.body.content;
     
@@ -59,9 +58,11 @@ app.get('/chat', (req, res) => {
     res.json({ messages: globalChatMessages });
 });
 
-app.post('/api/chat', handleChatPost);
-app.post('/chat/send', handleChatPost);
-app.post('/api/chat/send', handleChatPost);
+// Covers all variations of the chat send route
+app.post('/chat/send', handleChat);
+app.post('/api/chat/send', handleChat);
+app.post('/api/chat', handleChat);
+app.post('/chat', handleChat);
 
 app.get('/api/configs/:name', (req, res) => {
     const configName = req.params.name;
