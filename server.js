@@ -26,6 +26,12 @@ let nextMessageId = 1;
 
 const presence = new Map();
 
+function str(value, fallback = '') {
+    return typeof value === 'string'
+        ? value.trim()
+        : fallback;
+}
+
 function loadData() {
     try {
         const data = JSON.parse(
@@ -48,7 +54,9 @@ function loadData() {
 
         for (const player of leaderboard) {
             player.Identity = String(
-                player.Identity || player.identity || 'anonymous'
+                player.Identity ||
+                player.identity ||
+                'anonymous'
             );
 
             player.UserId = Number(player.UserId) || 0;
@@ -60,7 +68,13 @@ function loadData() {
 
             player.TotalSeconds = Math.max(
                 0,
-                Number(player.TotalSeconds || player.Time || 0)
+                Number(
+                    player.TotalSeconds ??
+                    player.Seconds ??
+                    player.OnlineTime ??
+                    player.Time ??
+                    0
+                ) || 0
             );
 
             player.LastSeen = Number(player.LastSeen) || 0;
@@ -106,12 +120,6 @@ function saveData() {
     } catch (error) {
         console.error('Save error:', error.message);
     }
-}
-
-function str(value, fallback = '') {
-    return typeof value === 'string'
-        ? value.trim()
-        : fallback;
 }
 
 function getIdentity(req) {
@@ -217,19 +225,27 @@ function getOrCreatePlayer(req, identity) {
         player.NamePreview || 'Anonymous'
     ).slice(0, 64);
 
+    player.TotalSeconds = Math.max(
+        0,
+        Number(player.TotalSeconds) || 0
+    );
+
     return player;
 }
 
 function formatPlayer(player, online) {
     const total = Math.max(
         0,
-        Math.floor(Number(player.TotalSeconds) || 0)
+        Math.floor(
+            Number(player.TotalSeconds) || 0
+        )
     );
 
     return {
         Identity: player.Identity,
         UserId: player.UserId,
         NamePreview: player.NamePreview,
+        Seconds: total,
         TotalSeconds: total,
         OnlineTime: total,
         Time: total,
@@ -687,7 +703,9 @@ app.post('/presence/heartbeat', (req, res) => {
         Count: presence.size,
         count: presence.size,
         Player: result,
-        player: result
+        player: result,
+        Seconds: result.Seconds,
+        TotalSeconds: result.TotalSeconds
     });
 });
 
@@ -718,7 +736,7 @@ app.get('/presence/leaderboard', (req, res) => {
             online.has(player.Identity)
         ))
         .sort((a, b) =>
-            b.TotalSeconds - a.TotalSeconds
+            b.Seconds - a.Seconds
         )
         .slice(0, limit);
 
