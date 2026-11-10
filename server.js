@@ -5,6 +5,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.use((req, res, next) => {
+    req.url = req.url.replace(/\/+/g, '/');
+    next();
+});
+
 let activeUsers = new Map();
 let globalChatMessages = [];
 let cloudConfigs = new Map();
@@ -28,11 +33,12 @@ app.get('/api/users', (req, res) => {
 });
 
 const handleChat = (req, res) => {
+    // Look for text across all common payload variations sent by UI libraries
     const username = req.body.username || req.body.Player || "Anonymous";
-    const text = req.body.text || req.body.Message || req.body.content;
+    const text = req.body.text || req.body.message || req.body.content || req.body.msg;
     
-    if (!text || text.trim() === '') {
-        return res.status(400).json({ error: "Message text cannot be empty" });
+    if (!text || typeof text !== 'string' || text.trim() === '') {
+        return res.status(400).json({ error: "Message text can't be empty" });
     }
 
     const newMessage = {
@@ -58,7 +64,6 @@ app.get('/chat', (req, res) => {
     res.json({ messages: globalChatMessages });
 });
 
-// Covers all variations of the chat send route
 app.post('/chat/send', handleChat);
 app.post('/api/chat/send', handleChat);
 app.post('/api/chat', handleChat);
