@@ -4,6 +4,8 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.text());
 
 app.use((req, res, next) => {
     req.url = req.url.replace(/\/+/g, '/');
@@ -33,12 +35,29 @@ app.get('/api/users', (req, res) => {
 });
 
 const handleChat = (req, res) => {
-    // Look for text across all common payload variations sent by UI libraries
-    const username = req.body.username || req.body.Player || "Anonymous";
-    const text = req.body.text || req.body.message || req.body.content || req.body.msg;
-    
+    // Debug what the UI library is actually sending
+    console.log("Chat POST body:", req.body);
+
+    let text = "";
+    let username = "Anonymous";
+
+    if (typeof req.body === 'string') {
+        text = req.body;
+    } else if (req.body) {
+        text = req.body.text || req.body.message || req.body.content || req.body.msg || req.body.Text || req.body.Message;
+        username = req.body.username || req.body.Player || req.body.Username || "Anonymous";
+        
+        // If text is still missing, check if the whole body is just the text string or wrapped differently
+        if (!text && typeof req.body === 'object') {
+            const values = Object.values(req.body);
+            if (values.length > 0 && typeof values[0] === 'string') {
+                text = values[0];
+            }
+        }
+    }
+
     if (!text || typeof text !== 'string' || text.trim() === '') {
-        return res.status(400).json({ error: "Message text can't be empty" });
+        return res.status(400).json({ error: "Message text can't be empty", received: req.body });
     }
 
     const newMessage = {
