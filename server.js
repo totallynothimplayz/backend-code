@@ -1,112 +1,800 @@
+
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
 const app = express();
+app.set('trust proxy', 1);
 
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.text());
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use(express.text({ limit: '2mb' }));
 
-app.use((req, res, next) => {
-    req.url = req.url.replace(/\/+/g, '/');
-    next();
-});
+const DATA_FILE = process.env.DATA_FILE ||
+    path.join(__dirname, 'data', 'cloud-data.json');
 
-let activeUsers = new Map();
-let globalChatMessages = [];
-let cloudConfigs = new Map();
+const CHAT_LIMIT = 100;
+const PRESENCE_TTL = 60_000;
+
+let configs = [];
+let messages = [];
+const presence = new Map();
+
+function loadData() {
+    try {
+        const data = JSON.parse(
+            fs.readFileSync(DATA_FILE, 'utf8')
+        );
+
+        configs = Array.isArray(data.configs)
+            ? data.configs
+            : [];
+
+        messages = Array.isArray(data.messages)
+            ? data.messages
+            : [];
+
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            console.error('Data load failed:', error.message);
+        }
+
+        configs = [];
+        messages = [];
+    }
+}
+
+function persist() {
+    try {
+        fs.mkdirSync(path.dirname(DATA_FILE), {
+            recursive: true
+        });
+
+        const temp = `${DATA_FILE}.tmp`;
+
+        fs.writeFileSync(
+            temp,
+            JSON.stringify({
+                configs,
+                messages
+            }, null, 2)
+        );
+
+        fs.renameSync(temp, DATA_FILE);
+
+    } catch (error) {
+        console.error('Data save failed:', error.message);
+    }
+}
+
+function str(value, fallback = '') {
+    return typeof value === 'string'
+        ? value.trim()
+        : fallback;
+}
+
+function identity(req) {
+    return str(
+        req.headers['x-nullui-identity'] ||
+        req.headers['x-user-id'] ||
+        req.body?.UserId ||
+        req.body?.userId ||
+        req.body?.Username ||
+        req.body?.username,
+        'anonymous'
+    ).slice(0, 128);
+}
+
+function scriptName(req) {
+    return str(
+        req.headers['x-nullui-script'] ||
+        req.body?.Script ||
+        req.body?.script,
+        'unknown'
+    ).slice(0, 128);
+}
+
+function payloadFrom(body) {
+    if (
+        !body ||
+        typeof body !== 'object' ||
+        Array.isArray(body)
+    ) {
+        return null;
+    }
+
+    return body.config ??
+        body.Config ??
+        body.data ??
+        body.Data ??
+        body;
+}
+
+function publicConfig(config) {
+    return {
+        id: config.id,
+        name: config.name,
+        title: config.name,
+        description: config.description,
+        script: config.script,
+        author: config.author,
+        createdAt: config.createdAt,
+        updatedAt: config.updatedAt,
+        likes: config.likes,
+        downloads: config.downloads,
+        shareCode: config.shareCode,
+        data: config.data
+    };
+}
+
+function findConfig(key) {
+    return configs.find(item =>
+        item.id === key ||
+        item.shareCode === key
+    );
+}
+
+loadData();
 
 app.get('/', (req, res) => {
-    res.json({ status: "ok", message: "Vind UI Backend Running" });
+    res.json({
+        status: 'ok',
+        message: 'Vind UI Backend Running'
+    });
 });
 
-app.post('/api/heartbeat', (req, res) => {
-    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
-    activeUsers.set(userId, Date.now());
-    res.json({ success: true, online: activeUsers.size });
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok'
+    });
 });
 
-app.get('/api/users', (req, res) => {
-    const now = Date.now();
-    for (const [id, lastSeen] of activeUsers.entries()) {
-        if (now - lastSeen > 60000) activeUsers.delete(id);
-    }
-    res.json({ count: activeUsers.size });
-});
+// CONFIG BROWSING
 
-const handleChat = (req, res) => {
-    const body = req.body || {};
-    const query = req.query || {};
+function listConfigs(req, res) {
+    const query = str(req.query.q).toLowerCase();
 
-    let text = "";
-    let username = "Anonymous";
+    const sort = str(
+        req.query.sort,
+        'new'
+    );
 
-    if (typeof body === 'string' && body.trim() !== '') {
-        text = body;
+    const limit = Math.min(
+        Math.max(
+            parseInt(req.query.limit, 10) || 20,
+            1
+        ),
+        100
+    );
+
+    let list = configs.filter(item => {
+        if (!query) return true;
+
+        const searchable = [
+            item.name,
+            item.description || '',
+            item.author || '',
+            item.script || ''
+        ].join(' ').toLowerCase();
+
+        return searchable.includes(query);
+    });
+
+    if (
+        sort === 'top' ||
+        sort === 'popular'
+    ) {
+        list.sort((a, b) =>
+            b.likes - a.likes ||
+            b.createdAt - a.createdAt
+        );
+
+    } else if (sort === 'downloads') {
+        list.sort((a, b) =>
+            b.downloads - a.downloads
+        );
+
     } else {
-        text = body.text || body.message || body.content || body.msg || body.Text || body.Message || body.Content || body.input || body.value || query.text;
-        username = body.username || body.Player || body.Username || "Anonymous";
+        list.sort((a, b) =>
+            b.createdAt - a.createdAt
+        );
     }
 
-    // Foolproof fallback: if text is still blank, grab anything or use a default string so it NEVER errors 400
-    if (!text || typeof text !== 'string' || text.trim() === '') {
-        if (typeof body === 'object' && Object.keys(body).length > 0) {
-            text = JSON.stringify(body);
+    const offset = Math.max(
+        parseInt(req.query.cursor, 10) || 0,
+        0
+    );
+
+    const page = list
+        .slice(offset, offset + limit)
+        .map(publicConfig);
+
+    const next = offset + limit < list.length
+        ? String(offset + limit)
+        : null;
+
+    res.json({
+        success: true,
+        Items: page,
+        items: page,
+        NextCursor: next,
+        nextCursor: next
+    });
+}
+
+app.get(
+    ['/configs', '/api/configs'],
+    listConfigs
+);
+
+// MY CONFIGS
+
+app.get(
+    ['/configs/mine', '/api/configs/mine'],
+    (req, res) => {
+        const mine = configs
+            .filter(item => item.owner === identity(req))
+            .map(publicConfig);
+
+        res.json({
+            success: true,
+            Items: mine,
+            items: mine
+        });
+    }
+);
+
+// LOAD CONFIG BY SHARE CODE
+
+app.get(
+    [
+        '/configs/code/:shareCode',
+        '/api/configs/code/:shareCode'
+    ],
+    (req, res) => {
+        const item = findConfig(
+            req.params.shareCode
+        );
+
+        if (!item) {
+            return res.status(404).json({
+                success: false,
+                error: 'Config not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            data: item.data,
+            config: publicConfig(item),
+            item: publicConfig(item)
+        });
+    }
+);
+
+// LOAD CONFIG BY ID
+
+app.get(
+    ['/configs/:id', '/api/configs/:id'],
+    (req, res) => {
+        const item = findConfig(
+            req.params.id
+        );
+
+        if (!item) {
+            return res.status(404).json({
+                success: false,
+                error: 'Config not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            data: item.data,
+            config: publicConfig(item),
+            item: publicConfig(item)
+        });
+    }
+);
+
+// PUBLISH CONFIG
+
+app.post(
+    ['/configs', '/api/configs'],
+    (req, res) => {
+        const data = payloadFrom(req.body);
+
+        if (
+            data === null ||
+            data === undefined
+        ) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid config data'
+            });
+        }
+
+        const owner = identity(req);
+
+        const name = str(
+            req.body?.name ||
+            req.body?.Name ||
+            req.body?.title ||
+            req.body?.Title,
+            'Untitled config'
+        ).slice(0, 100);
+
+        const item = {
+            id: crypto.randomUUID(),
+
+            shareCode: crypto
+                .randomBytes(6)
+                .toString('hex')
+                .toUpperCase(),
+
+            name,
+
+            description: str(
+                req.body?.description ||
+                req.body?.Description
+            ).slice(0, 500),
+
+            script: scriptName(req),
+
+            author: owner,
+            owner,
+
+            ownerToken: crypto
+                .randomBytes(24)
+                .toString('hex'),
+
+            data,
+
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+
+            likes: 0,
+            downloads: 0,
+            likedBy: []
+        };
+
+        configs.unshift(item);
+
+        persist();
+
+        res.status(201).json({
+            success: true,
+            message: 'Config published',
+            id: item.id,
+            shareCode: item.shareCode,
+            token: item.ownerToken,
+            data: publicConfig(item),
+            config: publicConfig(item),
+            item: publicConfig(item)
+        });
+    }
+);
+
+// DELETE CONFIG
+
+app.delete(
+    ['/configs/:id', '/api/configs/:id'],
+    (req, res) => {
+        const index = configs.findIndex(
+            item => item.id === req.params.id
+        );
+
+        if (index < 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Config not found'
+            });
+        }
+
+        const item = configs[index];
+
+        const token = str(
+            req.headers['x-nullui-token'] ||
+            req.body?.token ||
+            req.body?.Token
+        );
+
+        if (
+            item.owner !== identity(req) &&
+            (!token || token !== item.ownerToken)
+        ) {
+            return res.status(403).json({
+                success: false,
+                error: 'Not authorized to delete this config'
+            });
+        }
+
+        configs.splice(index, 1);
+
+        persist();
+
+        res.json({
+            success: true,
+            message: 'Config deleted'
+        });
+    }
+);
+
+// LIKE CONFIG
+
+app.post(
+    [
+        '/configs/:id/like',
+        '/api/configs/:id/like'
+    ],
+    (req, res) => {
+        const item = findConfig(
+            req.params.id
+        );
+
+        if (!item) {
+            return res.status(404).json({
+                success: false,
+                error: 'Config not found'
+            });
+        }
+
+        const user = identity(req);
+
+        if (!item.likedBy.includes(user)) {
+            item.likedBy.push(user);
+            item.likes += 1;
+
+            persist();
+        }
+
+        res.json({
+            success: true,
+            likes: item.likes,
+            Likes: item.likes
+        });
+    }
+);
+
+// DOWNLOAD CONFIG
+
+app.post(
+    [
+        '/configs/:id/download',
+        '/api/configs/:id/download'
+    ],
+    (req, res) => {
+        const item = findConfig(
+            req.params.id
+        );
+
+        if (!item) {
+            return res.status(404).json({
+                success: false,
+                error: 'Config not found'
+            });
+        }
+
+        item.downloads += 1;
+
+        persist();
+
+        res.json({
+            success: true,
+            data: item.data,
+            config: publicConfig(item),
+            item: publicConfig(item)
+        });
+    }
+);
+
+// LEGACY NAMED CONFIG API
+
+app.get(
+    '/api/configs/name/:name',
+    (req, res) => {
+        const item = configs.find(config =>
+            config.name === req.params.name &&
+            config.owner === identity(req)
+        );
+
+        if (!item) {
+            return res.status(404).json({
+                success: false,
+                error: 'Config not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            data: item.data
+        });
+    }
+);
+
+app.post(
+    '/api/configs/name/:name',
+    (req, res) => {
+        const data = payloadFrom(req.body);
+
+        if (
+            data === null ||
+            data === undefined
+        ) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid config data'
+            });
+        }
+
+        const owner = identity(req);
+
+        const name = req.params.name.slice(
+            0,
+            100
+        );
+
+        let item = configs.find(config =>
+            config.name === name &&
+            config.owner === owner
+        );
+
+        if (item) {
+            item.data = data;
+            item.updatedAt = Date.now();
+
         } else {
-            text = "User message";
+            item = {
+                id: crypto.randomUUID(),
+
+                shareCode: crypto
+                    .randomBytes(6)
+                    .toString('hex')
+                    .toUpperCase(),
+
+                name,
+                description: '',
+                script: scriptName(req),
+
+                author: owner,
+                owner,
+
+                ownerToken: crypto
+                    .randomBytes(24)
+                    .toString('hex'),
+
+                data,
+
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+
+                likes: 0,
+                downloads: 0,
+                likedBy: []
+            };
+
+            configs.unshift(item);
+        }
+
+        persist();
+
+        res.json({
+            success: true,
+            message: `Config '${name}' saved`,
+            data: publicConfig(item)
+        });
+    }
+);
+
+// PRESENCE
+
+function heartbeat(req, res) {
+    presence.set(identity(req), {
+        lastSeen: Date.now(),
+        script: scriptName(req)
+    });
+
+    res.json({
+        success: true,
+        count: presence.size,
+        online: presence.size
+    });
+}
+
+function prunePresence() {
+    const now = Date.now();
+
+    for (const [user, value] of presence) {
+        if (
+            now - value.lastSeen >
+            PRESENCE_TTL
+        ) {
+            presence.delete(user);
         }
     }
+}
 
-    const newMessage = {
-        id: Date.now().toString(),
-        username: username,
-        text: text.trim(),
+app.post(
+    [
+        '/presence/heartbeat',
+        '/api/heartbeat'
+    ],
+    heartbeat
+);
+
+app.get(
+    ['/presence/count', '/api/users'],
+    (req, res) => {
+        prunePresence();
+
+        res.json({
+            success: true,
+            count: presence.size,
+            online: presence.size
+        });
+    }
+);
+
+app.get(
+    '/presence/leaderboard',
+    (req, res) => {
+        prunePresence();
+
+        const users = [...presence.keys()];
+
+        res.json({
+            success: true,
+            Items: users,
+            items: users,
+            count: users.length,
+            online: users.length
+        });
+    }
+);
+
+// CHAT
+
+function handleChat(req, res) {
+    const body = typeof req.body === 'string'
+        ? { text: req.body }
+        : (req.body || {});
+
+    const text = str(
+        body.Text ||
+        body.text ||
+        body.Message ||
+        body.message ||
+        body.Content ||
+        body.content ||
+        body.msg ||
+        body.input ||
+        body.value ||
+        req.query.text
+    ).slice(0, 1000);
+
+    if (!text) {
+        return res.status(400).json({
+            success: false,
+            error: 'Message text is required'
+        });
+    }
+
+    const userId = identity(req);
+
+    const username = str(
+        body.Username ||
+        body.username ||
+        body.Player ||
+        body.UserName,
+        userId
+    ).slice(0, 64);
+
+    const message = {
+        id: crypto.randomUUID(),
+
+        UserId: userId,
+        userId,
+
+        Username: username,
+        username,
+
+        Text: text,
+        text,
+
         timestamp: Date.now()
     };
 
-    globalChatMessages.push(newMessage);
-    if (globalChatMessages.length > 50) {
-        globalChatMessages.shift();
+    messages.push(message);
+
+    if (messages.length > CHAT_LIMIT) {
+        messages = messages.slice(-CHAT_LIMIT);
     }
 
-    res.json({ success: true, message: newMessage, messages: globalChatMessages });
-};
+    persist();
 
-app.get('/api/chat', (req, res) => {
-    res.json({ messages: globalChatMessages });
-});
+    res.json({
+        success: true,
+        message,
+        Messages: messages,
+        messages
+    });
+}
 
-app.get('/chat', (req, res) => {
-    res.json({ messages: globalChatMessages });
-});
+app.post(
+    [
+        '/chat/send',
+        '/api/chat/send',
+        '/api/chat',
+        '/chat'
+    ],
+    handleChat
+);
 
-app.post('/chat/send', handleChat);
-app.post('/api/chat/send', handleChat);
-app.post('/api/chat', handleChat);
-app.post('/chat', handleChat);
+app.get(
+    ['/chat', '/api/chat'],
+    (req, res) => {
+        const since = Number(
+            req.query.since ||
+            req.query.Since ||
+            0
+        );
 
-app.get('/api/configs/:name', (req, res) => {
-    const configName = req.params.name;
-    if (cloudConfigs.has(configName)) {
-        res.json({ success: true, data: cloudConfigs.get(configName) });
-    } else {
-        res.status(404).json({ error: "Config not found" });
+        const result =
+            Number.isFinite(since) && since > 0
+                ? messages.filter(item =>
+                    item.timestamp > since
+                )
+                : messages;
+
+        res.json({
+            success: true,
+            Messages: result,
+            messages: result
+        });
     }
+);
+
+// ERRORS
+
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint not found',
+        path: req.path
+    });
 });
 
-app.post('/api/configs/:name', (req, res) => {
-    const configName = req.params.name;
-    const configData = req.body;
+app.use((err, req, res, next) => {
+    console.error('Request error:', err.message);
 
-    if (!configData || Object.keys(configData).length === 0) {
-        return res.status(400).json({ error: "Invalid config data" });
+    res.status(err.status || 500).json({
+        success: false,
+        error: err.status === 413
+            ? 'Request too large'
+            : 'Internal server error'
+    });
+});
+
+// RENDER
+
+const PORT = Number(process.env.PORT) || 10000;
+
+const server = app.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+        console.log(
+            `Vind UI backend listening on 0.0.0.0:${PORT}`
+        );
     }
+);
 
-    cloudConfigs.set(configName, configData);
-    res.json({ success: true, message: `Config '${configName}' saved` });
-});
+function shutdown() {
+    server.close(() => process.exit(0));
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
